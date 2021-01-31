@@ -15,6 +15,7 @@
 #include "Z80MachineFunctionInfo.h"
 #include "Z80Subtarget.h"
 #include "Z80TargetMachine.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "llvm/CodeGen/GlobalISel/MIPatternMatch.h"
 #include <initializer_list>
@@ -23,16 +24,57 @@ using namespace TargetOpcode;
 using namespace LegalizeActions;
 using namespace MIPatternMatch;
 
+static LegalityPredicate typeNotInSet(unsigned TypeIdx,
+                                      std::initializer_list<LLT> TypesInit) {
+  using namespace LegalityPredicates;
+  SmallVector<LLT, 8> Types = TypesInit;
+  return [=](const LegalityQuery &Query) {
+    return !is_contained(Types, Query.Types[TypeIdx]);
+  };
+}
+
+static LegalityPredicate scalarNotInSet(unsigned TypeIdx,
+                                        std::initializer_list<LLT> Types) {
+  using namespace LegalityPredicates;
+  return all(isScalar(TypeIdx), typeNotInSet(TypeIdx, Types));
+}
+
+static LegalizeRuleSet &
+widenScalarToNextOrNarrowToLast(LegalizeRuleSet &Builder, unsigned TypeIdx,
+                                std::initializer_list<LLT> TypesInit) {
+  using namespace LegalityPredicates;
+  SmallVector<LLT, 8> Types = TypesInit;
+  assert(!Types.empty() && is_sorted(Types, [](LLT Ty1, LLT Ty2) {
+    return Ty1.getSizeInBits() < Ty2.getSizeInBits();
+  }) && "Expected type set to be not empty and sorted by width.");
+  return Builder.maxScalar(TypeIdx, Types.back())
+      .widenScalarIf(
+          scalarNotInSet(TypeIdx, TypesInit), [=](const LegalityQuery &Query) {
+            LLT QueryTy = Query.Types[TypeIdx];
+            for (LLT Ty : reverse(Types))
+              if (QueryTy.getSizeInBits() < Ty.getSizeInBits())
+                return std::make_pair(TypeIdx, Ty);
+            llvm_unreachable("Scalar wider than last already handled.");
+          });
+}
+
 Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
                                    const Z80TargetMachine &TM)
     : Subtarget(STI), TM(TM) {
+  using namespace LegalizeActions;
+  using namespace LegalityPredicates;
+  using namespace LegalizeMutations;
+
   bool Is24Bit = Subtarget.is24Bit();
+  LegalityPredicate pred24Bit = [=](const LegalityQuery &) { return Is24Bit; };
+
   LLT p0 = LLT::pointer(0, TM.getPointerSizeInBits(0));
   LLT s1 = LLT::scalar(1);
   LLT s8 = LLT::scalar(8);
   LLT s16 = LLT::scalar(16);
   LLT s24 = LLT::scalar(24);
   LLT s32 = LLT::scalar(32);
+  LLT s48 = LLT::scalar(48);
   LLT s64 = LLT::scalar(64);
   LLT sMax = Is24Bit ? s24 : s16;
   auto LegalTypes24 = {p0, s8, s16, s24}, LegalTypes16 = {p0, s8, s16};
@@ -43,6 +85,9 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
   auto LegalLibcallScalars16 = {s8, s16, s32, s64};
   auto LegalLibcallScalars =
       Is24Bit ? LegalLibcallScalars24 : LegalLibcallScalars16;
+  auto LibcallScalars24 = {s8, s16, s24, s32, s48, s64};
+  auto LibcallScalars16 = {s8, s16, s32, s64};
+  auto LibcallScalars = Is24Bit ? LibcallScalars24 : LibcallScalars16;
   auto NotMax24 = {s8, s16}, NotMax16 = {s8};
   auto NotMax = Is24Bit ? NotMax24 : NotMax16;
   auto NotMin24 = {s16, s24}, NotMin16 = {s16};
@@ -113,13 +158,11 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
       .legalForCartesianProduct(LegalScalars, {s1})
       .clampScalar(0, s8, sMax);
 
-  {
-    auto &&Mul = getActionDefinitionsBuilder(G_MUL);
-    if (Subtarget.hasZ180Ops())
-      Mul.legalFor({s8});
-    Mul.libcallFor(LegalLibcallScalars)
-        .clampScalar(0, s8, s32);
-  }
+  getActionDefinitionsBuilder(G_MUL)
+      .legalIf(all(pred24Bit, typeIs(0, s8)))
+      .libcallFor(LegalLibcallScalars)
+      .narrowScalarIf(all(pred24Bit, typeIs(0, s48)), changeTo(0, s24))
+      .clampScalar(0, s8, s32);
 
   getActionDefinitionsBuilder({G_SDIV, G_UDIV, G_SREM, G_UREM})
       .libcallFor(LegalLibcallScalars)
@@ -130,10 +173,12 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
       .customFor(LegalLibcallScalars)
       .clampScalar(0, s8, s32);
 
-  getActionDefinitionsBuilder({G_SHL, G_LSHR, G_ASHR})
-      .customForCartesianProduct(LegalLibcallScalars, {s8})
-      .clampScalar(1, s8, s8)
-      .clampScalar(0, s8, s64);
+  widenScalarToNextOrNarrowToLast(
+      getActionDefinitionsBuilder({G_SHL, G_LSHR, G_ASHR})
+          .customForCartesianProduct(LegalLibcallScalars, {s8})
+          .clampScalar(1, s8, s8)
+          .narrowScalarIf(all(pred24Bit, typeIs(0, s48)), changeTo(0, s24)),
+      0, LibcallScalars);
 
   getActionDefinitionsBuilder({G_FSHL, G_FSHR, G_MEMCPY, G_MEMMOVE, G_MEMSET})
       .custom();
@@ -144,14 +189,11 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
                                G_FMINNUM, G_FMAXNUM, G_FRINT, G_FNEARBYINT})
       .libcallFor({s32, s64});
 
-  getActionDefinitionsBuilder(G_FCOPYSIGN)
-      .libcallFor({{s32, s32}, {s64, s64}});
+  getActionDefinitionsBuilder(G_FCOPYSIGN).libcallFor({{s32, s32}, {s64, s64}});
 
-  getActionDefinitionsBuilder(G_FPTRUNC)
-      .libcallFor({{s32, s64}});
+  getActionDefinitionsBuilder(G_FPTRUNC).libcallFor({{s32, s64}});
 
-  getActionDefinitionsBuilder(G_FPEXT)
-      .libcallFor({{s64, s32}});
+  getActionDefinitionsBuilder(G_FPEXT).libcallFor({{s64, s32}});
 
   getActionDefinitionsBuilder({G_FPTOSI, G_FPTOUI})
       .libcallForCartesianProduct({s32, s64}, {s32, s64})
@@ -172,19 +214,17 @@ Z80LegalizerInfo::Z80LegalizerInfo(const Z80Subtarget &STI,
       {G_FRAME_INDEX, G_GLOBAL_VALUE, G_BRINDIRECT, G_JUMP_TABLE})
       .legalFor({p0});
 
-  getActionDefinitionsBuilder(G_VASTART)
-      .customFor({p0});
+  getActionDefinitionsBuilder(G_VASTART).customFor({p0});
 
   getActionDefinitionsBuilder(G_ICMP)
       .legalForCartesianProduct({s1}, LegalTypes)
       .customForCartesianProduct({s1}, {s32, s64})
       .clampScalar(1, s8, s32);
 
-  getActionDefinitionsBuilder(G_FCMP)
-      .customForCartesianProduct({s1}, {s32, s64});
+  getActionDefinitionsBuilder(G_FCMP).customForCartesianProduct({s1},
+                                                                {s32, s64});
 
-  getActionDefinitionsBuilder(G_BRCOND)
-      .legalFor({s1});
+  getActionDefinitionsBuilder(G_BRCOND).legalFor({s1});
 
   getActionDefinitionsBuilder(G_BRJT)
       .legalForCartesianProduct({p0}, LegalScalars)

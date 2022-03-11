@@ -29,6 +29,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/ObjCARCUtil.h"
 #include "llvm/Analysis/VectorUtils.h"
 #include "llvm/CodeGen/Analysis.h"
@@ -938,19 +939,20 @@ AArch64TargetLowering::AArch64TargetLowering(const TargetMachine &TM,
 
   // In case of strict alignment, avoid an excessive number of byte wide stores.
   MaxStoresPerMemsetOptSize = 8;
-  MaxStoresPerMemset = Subtarget->requiresStrictAlign()
-                       ? MaxStoresPerMemsetOptSize : 32;
+  MaxStoresPerMemset =
+      Subtarget->requiresStrictAlign() ? MaxStoresPerMemsetOptSize : 32;
 
   MaxGluedStoresPerMemcpy = 4;
   MaxStoresPerMemcpyOptSize = 4;
-  MaxStoresPerMemcpy = Subtarget->requiresStrictAlign()
-                       ? MaxStoresPerMemcpyOptSize : 16;
+  MaxStoresPerMemcpy =
+      Subtarget->requiresStrictAlign() ? MaxStoresPerMemcpyOptSize : 16;
 
-  MaxStoresPerMemmoveOptSize = MaxStoresPerMemmove = 4;
+  MaxStoresPerMemmoveOptSize = 4;
+  MaxStoresPerMemmove = 4;
 
   MaxLoadsPerMemcmpOptSize = 4;
-  MaxLoadsPerMemcmp = Subtarget->requiresStrictAlign()
-                      ? MaxLoadsPerMemcmpOptSize : 8;
+  MaxLoadsPerMemcmp =
+      Subtarget->requiresStrictAlign() ? MaxLoadsPerMemcmpOptSize : 8;
 
   setStackPointerRegisterToSaveRestore(AArch64::SP);
 
@@ -1424,6 +1426,11 @@ AArch64TargetLowering::AArch64TargetLowering(const TargetMachine &TM,
     setOperationPromotedToType(ISD::VECTOR_SPLICE, MVT::nxv4i1, MVT::nxv4i32);
     setOperationPromotedToType(ISD::VECTOR_SPLICE, MVT::nxv8i1, MVT::nxv8i16);
     setOperationPromotedToType(ISD::VECTOR_SPLICE, MVT::nxv16i1, MVT::nxv16i8);
+  }
+
+  if (Subtarget->hasMOPS() && Subtarget->hasMTE()) {
+    // Only required for llvm.aarch64.mops.memset.tag
+    setOperationAction(ISD::INTRINSIC_W_CHAIN, MVT::i8, Custom);
   }
 
   PredictableSelectIsExpensive = Subtarget->predictableSelectIsExpensive();
@@ -2267,6 +2274,10 @@ const char *AArch64TargetLowering::getTargetNodeName(unsigned Opcode) const {
     MAKE_CASE(AArch64ISD::UADDLP)
     MAKE_CASE(AArch64ISD::CALL_RVMARKER)
     MAKE_CASE(AArch64ISD::ASSERT_ZEXT_BOOL)
+    MAKE_CASE(AArch64ISD::MOPS_MEMSET)
+    MAKE_CASE(AArch64ISD::MOPS_MEMSET_TAGGING)
+    MAKE_CASE(AArch64ISD::MOPS_MEMCOPY)
+    MAKE_CASE(AArch64ISD::MOPS_MEMMOVE)
   }
 #undef MAKE_CASE
   return nullptr;
@@ -4059,6 +4070,39 @@ static SDValue lowerConvertToSVBool(SDValue Op, SelectionDAG &DAG) {
   return DAG.getNode(ISD::AND, DL, OutVT, Reinterpret, MaskReinterpret);
 }
 
+SDValue AArch64TargetLowering::LowerINTRINSIC_W_CHAIN(SDValue Op,
+                                                      SelectionDAG &DAG) const {
+  unsigned IntNo = Op.getConstantOperandVal(1);
+  switch (IntNo) {
+  default:
+    return SDValue(); // Don't custom lower most intrinsics.
+  case Intrinsic::aarch64_mops_memset_tag: {
+    auto Node = cast<MemIntrinsicSDNode>(Op.getNode());
+    SDLoc DL(Op);
+    SDValue Chain = Node->getChain();
+    SDValue Dst = Op.getOperand(2);
+    SDValue Val = Op.getOperand(3);
+    Val = DAG.getAnyExtOrTrunc(Val, DL, MVT::i64);
+    SDValue Size = Op.getOperand(4);
+    auto Alignment = Node->getMemOperand()->getAlign();
+    bool IsVol = Node->isVolatile();
+    auto DstPtrInfo = Node->getPointerInfo();
+
+    const auto &SDI =
+        static_cast<const AArch64SelectionDAGInfo &>(DAG.getSelectionDAGInfo());
+    SDValue MS =
+        SDI.EmitMOPS(AArch64ISD::MOPS_MEMSET_TAGGING, DAG, DL, Chain, Dst, Val,
+                     Size, Alignment, IsVol, DstPtrInfo, MachinePointerInfo{});
+
+    // MOPS_MEMSET_TAGGING has 3 results (DstWb, SizeWb, Chain) whereas the
+    // intrinsic has 2. So hide SizeWb using MERGE_VALUES. Otherwise
+    // LowerOperationWrapper will complain that the number of results has
+    // changed.
+    return DAG.getMergeValues({MS.getValue(0), MS.getValue(2)}, DL);
+  }
+  }
+}
+
 SDValue AArch64TargetLowering::LowerINTRINSIC_WO_CHAIN(SDValue Op,
                                                      SelectionDAG &DAG) const {
   unsigned IntNo = cast<ConstantSDNode>(Op.getOperand(0))->getZExtValue();
@@ -5126,6 +5170,8 @@ SDValue AArch64TargetLowering::LowerOperation(SDValue Op,
   case ISD::MULHU:
     return LowerToPredicatedOp(Op, DAG, AArch64ISD::MULHU_PRED,
                                /*OverrideNEON=*/true);
+  case ISD::INTRINSIC_W_CHAIN:
+    return LowerINTRINSIC_W_CHAIN(Op, DAG);
   case ISD::INTRINSIC_WO_CHAIN:
     return LowerINTRINSIC_WO_CHAIN(Op, DAG);
   case ISD::ATOMIC_STORE:
@@ -8944,12 +8990,13 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
     if (V.isUndef())
       continue;
     else if (V.getOpcode() != ISD::EXTRACT_VECTOR_ELT ||
-             !isa<ConstantSDNode>(V.getOperand(1))) {
+             !isa<ConstantSDNode>(V.getOperand(1)) ||
+             V.getOperand(0).getValueType().isScalableVector()) {
       LLVM_DEBUG(
           dbgs() << "Reshuffle failed: "
                     "a shuffle can only come from building a vector from "
-                    "various elements of other vectors, provided their "
-                    "indices are constant\n");
+                    "various elements of other fixed-width vectors, provided "
+                    "their indices are constant\n");
       return SDValue();
     }
 
@@ -8993,8 +9040,8 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
   for (auto &Src : Sources) {
     EVT SrcVT = Src.ShuffleVec.getValueType();
 
-    uint64_t SrcVTSize = SrcVT.getFixedSizeInBits();
-    if (SrcVTSize == VTSize)
+    TypeSize SrcVTSize = SrcVT.getSizeInBits();
+    if (SrcVTSize == TypeSize::Fixed(VTSize))
       continue;
 
     // This stage of the search produces a source with the same element type as
@@ -9003,7 +9050,7 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
     unsigned NumSrcElts = VTSize / EltVT.getFixedSizeInBits();
     EVT DestVT = EVT::getVectorVT(*DAG.getContext(), EltVT, NumSrcElts);
 
-    if (SrcVTSize < VTSize) {
+    if (SrcVTSize.getFixedValue() < VTSize) {
       assert(2 * SrcVTSize == VTSize);
       // We can pad out the smaller vector for free, so if it's part of a
       // shuffle...
@@ -9013,7 +9060,7 @@ SDValue AArch64TargetLowering::ReconstructShuffle(SDValue Op,
       continue;
     }
 
-    if (SrcVTSize != 2 * VTSize) {
+    if (SrcVTSize.getFixedValue() != 2 * VTSize) {
       LLVM_DEBUG(
           dbgs() << "Reshuffle failed: result vector too small to extract\n");
       return SDValue();
@@ -9684,6 +9731,10 @@ static SDValue constructDup(SDValue V, int Lane, SDLoc dl, EVT VT,
     unsigned ExtIdxInBits = ExtIdx * SrcEltBitWidth;
     unsigned CastedEltBitWidth = BitCast.getScalarValueSizeInBits();
     if (ExtIdxInBits % CastedEltBitWidth != 0)
+      return false;
+
+    // Can't handle cases where vector size is not 128-bit
+    if (!Extract.getOperand(0).getValueType().is128BitVector())
       return false;
 
     // Update the lane value by offsetting with the scaled extract index.
@@ -11879,6 +11930,19 @@ bool AArch64TargetLowering::getTgtMemIntrinsic(IntrinsicInfo &Info,
     Info.flags = MachineMemOperand::MOStore | MachineMemOperand::MONonTemporal;
     return true;
   }
+  case Intrinsic::aarch64_mops_memset_tag: {
+    Value *Dst = I.getArgOperand(0);
+    Value *Val = I.getArgOperand(1);
+    Info.opc = ISD::INTRINSIC_W_CHAIN;
+    Info.memVT = MVT::getVT(Val->getType());
+    Info.ptrVal = Dst;
+    Info.offset = 0;
+    Info.align = I.getParamAlign(0).valueOrOne();
+    Info.flags = MachineMemOperand::MOStore;
+    // The size of the memory being operated on is unknown at this point
+    Info.size = MemoryLocation::UnknownSize;
+    return true;
+  }
   default:
     break;
   }
@@ -13617,8 +13681,10 @@ static SDValue performFpToIntCombine(SDNode *N, SelectionDAG &DAG,
     return SDValue();
 
   SDValue Op = N->getOperand(0);
-  if (!Op.getValueType().isVector() || !Op.getValueType().isSimple() ||
-      Op.getOpcode() != ISD::FMUL)
+  if (!Op.getValueType().isSimple() || Op.getOpcode() != ISD::FMUL)
+    return SDValue();
+
+  if (!Op.getValueType().is64BitVector() && !Op.getValueType().is128BitVector())
     return SDValue();
 
   SDValue ConstVec = Op->getOperand(1);
@@ -15422,6 +15488,12 @@ performSignExtendSetCCCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
          N->getOperand(0)->getOpcode() == ISD::SETCC);
   const SDValue SetCC = N->getOperand(0);
 
+  const SDValue CCOp0 = SetCC.getOperand(0);
+  const SDValue CCOp1 = SetCC.getOperand(1);
+  if (!CCOp0->getValueType(0).isInteger() ||
+      !CCOp1->getValueType(0).isInteger())
+    return SDValue();
+
   ISD::CondCode Code =
       cast<CondCodeSDNode>(SetCC->getOperand(2).getNode())->get();
 
@@ -15431,9 +15503,9 @@ performSignExtendSetCCCombine(SDNode *N, TargetLowering::DAGCombinerInfo &DCI,
   if (isCheapToExtend(SetCC.getOperand(0)) &&
       isCheapToExtend(SetCC.getOperand(1))) {
     const SDValue Ext1 =
-        DAG.getNode(ExtType, SDLoc(N), N->getValueType(0), SetCC.getOperand(0));
+        DAG.getNode(ExtType, SDLoc(N), N->getValueType(0), CCOp0);
     const SDValue Ext2 =
-        DAG.getNode(ExtType, SDLoc(N), N->getValueType(0), SetCC.getOperand(1));
+        DAG.getNode(ExtType, SDLoc(N), N->getValueType(0), CCOp1);
 
     return DAG.getSetCC(
         SDLoc(SetCC), N->getValueType(0), Ext1, Ext2,

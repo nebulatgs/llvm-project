@@ -118,6 +118,12 @@ typedef uint_t uint;
 #define STATVFS_F_FLAG(vfs) (vfs).f_flags
 #endif
 
+#if defined(__sun__)
+// The madvise() declaration on Illumos cannot be made visible if _XOPEN_SOURCE
+// is defined. This declaration is also compatible with Solaris 11.4.
+extern "C" int madvise(void *, size_t, int);
+#endif
+
 using namespace llvm;
 
 namespace llvm {
@@ -1462,7 +1468,7 @@ namespace fs {
 std::error_code copy_file(const Twine &From, const Twine &To) {
   std::string FromS = From.str();
   std::string ToS = To.str();
-#if __has_builtin(__builtin_available)
+#if 0 && __has_builtin(__builtin_available)
   if (__builtin_available(macos 10.12, *)) {
     // Optimistically try to use clonefile() and handle errors, rather than
     // calling stat() to see if it'll work.

@@ -285,6 +285,7 @@ static bool mayTailCallThisCC(CallingConv::ID CC) {
   case CallingConv::Z80_LibCall_BC:
   case CallingConv::Z80_LibCall_L:
   case CallingConv::Z80_LibCall_F:
+  case CallingConv::Z80_LibCall_16:
   case CallingConv::Z80_TIFlags:
     return true;
   default:
@@ -303,8 +304,8 @@ bool Z80CallLowering::doCallerAndCalleePassArgsTheSameWay(
   if (CalleeCC == CallerCC)
     return true;
 
-  IncomingValueAssigner CalleeAssigner(CC_Z80);
-  IncomingValueAssigner CallerAssigner(CC_Z80);
+  IncomingValueAssigner CalleeAssigner(RetCC_Z80);
+  IncomingValueAssigner CallerAssigner(RetCC_Z80);
   // Check if the caller and callee will handle arguments in the same way.
   if (!resultsCompatible(Info, MF, InArgs, CalleeAssigner, CallerAssigner))
     return false;

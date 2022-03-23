@@ -559,7 +559,7 @@ static RTLIB::Libcall getRTLibDesc(unsigned Opcode, unsigned Size) {
   case TargetOpcode::G_BITREVERSE:
     RTLIBCASE_ALL(BITREV_I);
   case TargetOpcode::G_CTLZ_ZERO_UNDEF:
-    RTLIBCASE_INT(CTLZ_I);
+    RTLIBCASE_ALL(CTLZ_I);
   case TargetOpcode::G_INTRINSIC_TRUNC:
     RTLIBCASE(TRUNC_F);
   case TargetOpcode::G_INTRINSIC_ROUND:
@@ -868,7 +868,6 @@ LegalizerHelper::libcall(MachineInstr &MI, LostDebugLocObserver &LocObserver) {
   case TargetOpcode::G_UDIV:
   case TargetOpcode::G_SREM:
   case TargetOpcode::G_UREM:
-  case TargetOpcode::G_CTLZ_ZERO_UNDEF:
   case TargetOpcode::G_BITREVERSE: {
     Type *HLTy = IntegerType::get(Ctx, Size);
     auto Status = simpleLibcall(MI, MIRBuilder, Size, HLTy);
@@ -876,6 +875,7 @@ LegalizerHelper::libcall(MachineInstr &MI, LostDebugLocObserver &LocObserver) {
       return Status;
     break;
   }
+  case TargetOpcode::G_CTLZ_ZERO_UNDEF:
   case TargetOpcode::G_CTPOP: {
     Type *ResTy = IntegerType::get(Ctx, Size);
     unsigned OpSize = MRI.getType(MI.getOperand(1).getReg()).getSizeInBits();
@@ -3444,7 +3444,6 @@ LegalizerHelper::lower(MachineInstr &MI, unsigned TypeIdx, LLT LowerHintTy) {
     Observer.changedInstr(MI);
 
     auto HiPart = MIRBuilder.buildInstr(Opcode, {Ty}, {LHS, RHS});
-    auto Zero = MIRBuilder.buildConstant(Ty, 0);
 
     // Move insert point forward so we can use the Res register if needed.
     MIRBuilder.setInsertPt(MIRBuilder.getMBB(), ++MIRBuilder.getInsertPt());
@@ -3456,6 +3455,7 @@ LegalizerHelper::lower(MachineInstr &MI, unsigned TypeIdx, LLT LowerHintTy) {
       auto Shifted = MIRBuilder.buildAShr(Ty, Res, ShiftAmt);
       MIRBuilder.buildICmp(CmpInst::ICMP_NE, Overflow, HiPart, Shifted);
     } else {
+      auto Zero = MIRBuilder.buildConstant(Ty, 0);
       MIRBuilder.buildICmp(CmpInst::ICMP_NE, Overflow, HiPart, Zero);
     }
     return Legalized;
